@@ -13,6 +13,7 @@
 1번 탭의 "실행" 버튼은 실제로 광고그룹을 생성하고 소재를 등록합니다(라이브 API 호출).
 2/3번 탭은 "미리보기"(읽기 전용)를 먼저 돌려보고, 확인 체크박스를 켠 뒤 "실행" 버튼을 눌러야
 실제로 네이버에 반영됩니다.
+
 """
 
 import base64
@@ -1042,8 +1043,8 @@ def make_progress(progress_bar, log_box):
 # =========================
 # Streamlit UI
 # =========================
-st.set_page_config(page_title="그라펜 쇼핑검색광고 통합 관리", layout="wide")
-st.title("그라펜 쇼핑검색광고 통합 관리")
+st.set_page_config(page_title="쇼핑검색광고 통합 관리", layout="wide")
+st.title("쇼핑검색광고 통합 관리")
 
 st.warning("API Key/Secret Key는 화면 입력값으로만 사용하는 것을 권장합니다.")
 
