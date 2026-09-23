@@ -1,5 +1,5 @@
 """
-그라펜 - 네이버 쇼핑검색광고 통합 관리 (Streamlit)
+네이버 쇼핑검색광고 통합 관리 (Streamlit)
 
 세 개 기능을 하나의 UI(탭)로 통합:
   1) 카테고리별 광고그룹 생성 & 상품 등록 - CSV 업로드 -> 카테고리별 광고그룹 생성 -> SHOPPING_PRODUCT_AD 소재 일괄 등록
@@ -8,7 +8,7 @@
 
 실행:
     pip install -r requirements_streamlit.txt
-    streamlit run 그라펜_확장소재_streamlit.py
+    streamlit run 확장소재_streamlit.py
 
 1번 탭의 "실행" 버튼은 실제로 광고그룹을 생성하고 소재를 등록합니다(라이브 API 호출).
 2/3번 탭은 "미리보기"(읽기 전용)를 먼저 돌려보고, 확인 체크박스를 켠 뒤 "실행" 버튼을 눌러야
