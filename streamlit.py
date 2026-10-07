@@ -880,11 +880,17 @@ def get_ad_extensions_by_owner(api_key, secret_key, customer_id, owner_id):
     return res.json()
 
 
-def find_existing_promotion(api_key, secret_key, customer_id, adgroup_id):
-    for ext in get_ad_extensions_by_owner(api_key, secret_key, customer_id, adgroup_id):
-        if ext.get("type") == "PROMOTION":
-            return ext
-    return None
+def find_existing_promotions(api_key, secret_key, customer_id, adgroup_id):
+    return [
+        ext for ext in get_ad_extensions_by_owner(api_key, secret_key, customer_id, adgroup_id)
+        if ext.get("type") == "PROMOTION"
+    ]
+
+
+def get_promotion_texts(ext):
+    # 실제 응답 구조: {"adExtension": {"basicText": 문구1, "additionalText": 문구2}}
+    content = ext.get("adExtension") or {}
+    return content.get("basicText"), content.get("additionalText")
 
 
 def create_promotion(api_key, secret_key, customer_id, adgroup_id, text1, text2):
@@ -892,22 +898,35 @@ def create_promotion(api_key, secret_key, customer_id, adgroup_id, text1, text2)
         "ownerId": adgroup_id,
         "type": "PROMOTION",
         "userLock": False,
-        "headline": text1,
-        "description": text2,
+        "adExtension": {"basicText": text1, "additionalText": text2},
     }
     return api_request(api_key, secret_key, customer_id, "POST", "/ncc/ad-extensions", json_data=payload)
 
 
-def update_promotion(api_key, secret_key, customer_id, ext_id, adgroup_id, text1, text2):
-    payload = {
-        "nccAdExtensionId": ext_id,
-        "ownerId": adgroup_id,
-        "type": "PROMOTION",
-        "userLock": False,
-        "headline": text1,
-        "description": text2,
-    }
-    return api_request(api_key, secret_key, customer_id, "PUT", f"/ncc/ad-extensions/{ext_id}", json_data=payload)
+def delete_ad_extension(api_key, secret_key, customer_id, ext_id):
+    return api_request(api_key, secret_key, customer_id, "DELETE", f"/ncc/ad-extensions/{ext_id}")
+
+
+def replace_promotion(api_key, secret_key, customer_id, adgroup_id, old_promotions, text1, text2):
+    """
+    PUT /ncc/ad-extensions 는 200을 주지만 문구(adExtension)는 바뀌지 않음 (실측 확인).
+    그래서 새 문구로 생성 -> 생성 성공 시에만 기존 PROMOTION 삭제 (다른 타입 확장소재는 건드리지 않음).
+    반환: (성공여부, 메시지)
+    """
+    res = create_promotion(api_key, secret_key, customer_id, adgroup_id, text1, text2)
+    if res is None or not res.ok:
+        return False, f"생성 실패: {res.status_code} / {res.text}" if res is not None else "생성 응답 없음"
+
+    failed = []
+    for p in old_promotions:
+        time.sleep(REQUEST_DELAY)
+        del_res = delete_ad_extension(api_key, secret_key, customer_id, p["nccAdExtensionId"])
+        if del_res is None or not del_res.ok:
+            failed.append(p["nccAdExtensionId"])
+
+    if failed:
+        return False, f"새 문구 생성됨, 기존 삭제 실패: {', '.join(failed)}"
+    return True, f"기존 {len(old_promotions)}개 삭제"
 
 
 def run_promotion(api_key, secret_key, customer_id, campaigns, text1, text2, dry_run, progress_cb=None):
@@ -922,11 +941,12 @@ def run_promotion(api_key, secret_key, customer_id, campaigns, text1, text2, dry
     for i, (campaign_name, ag) in enumerate(adgroup_list, 1):
         adgroup_id = ag["nccAdgroupId"]
         adgroup_name = ag.get("name")
-        existing = find_existing_promotion(api_key, secret_key, customer_id, adgroup_id)
+        promotions = find_existing_promotions(api_key, secret_key, customer_id, adgroup_id)
 
-        if existing is None:
+        # 그룹에 홍보문구가 여러 개일 수 있으므로, 하나라도 이미 같은 문구면 스킵
+        if not promotions:
             action = "생성"
-        elif existing.get("headline") == text1 and existing.get("description") == text2:
+        elif any(get_promotion_texts(p) == (text1, text2) for p in promotions):
             action = "변경없음"
         else:
             action = "수정"
@@ -936,20 +956,19 @@ def run_promotion(api_key, secret_key, customer_id, campaigns, text1, text2, dry
         if not dry_run:
             if action == "변경없음":
                 status = "스킵(동일)"
-            else:
-                if action == "생성":
-                    res = create_promotion(api_key, secret_key, customer_id, adgroup_id, text1, text2)
-                else:
-                    res = update_promotion(
-                        api_key, secret_key, customer_id,
-                        existing["nccAdExtensionId"], adgroup_id, text1, text2,
-                    )
-
+            elif action == "생성":
+                res = create_promotion(api_key, secret_key, customer_id, adgroup_id, text1, text2)
                 if res is not None and res.ok:
                     status = "성공"
                 else:
                     status = "실패"
                     message = f"{res.status_code} / {res.text}" if res is not None else "응답 없음"
+                time.sleep(REQUEST_DELAY)
+            else:
+                ok, message = replace_promotion(
+                    api_key, secret_key, customer_id, adgroup_id, promotions, text1, text2,
+                )
+                status = "성공" if ok else "실패"
                 time.sleep(REQUEST_DELAY)
 
         rows.append({
@@ -1042,17 +1061,17 @@ def make_progress(progress_bar, log_box):
 # =========================
 # Streamlit UI
 # =========================
-st.set_page_config(page_title="쇼핑검색광고 통합 관리", layout="wide")
-st.title("쇼핑검색광고 통합 관리")
+st.set_page_config(page_title="그라펜 쇼핑검색광고 통합 관리", layout="wide")
+st.title("그라펜 쇼핑검색광고 통합 관리")
 
 st.warning("API Key/Secret Key는 화면 입력값으로만 사용하는 것을 권장합니다.")
 
 with st.sidebar:
     st.header("네이버 검색광고 API 계정")
     settings = load_settings()
-    api_key = st.text_input("API Key", value=settings.get("api_key", ""), type="password")
-    secret_key = st.text_input("Secret Key", value=settings.get("secret_key", ""), type="password")
-    customer_id = st.text_input("Customer ID", value=settings.get("customer_id", ""))
+    api_key = st.text_input("API Key", value=settings.get("api_key", ""), type="password").strip()
+    secret_key = st.text_input("Secret Key", value=settings.get("secret_key", ""), type="password").strip()
+    customer_id = st.text_input("Customer ID", value=settings.get("customer_id", "")).strip()
     st.caption("대행사 키라 Customer ID만 바꾸면 다른 광고주 계정에도 그대로 쓸 수 있습니다.")
 
 tab_group, tab_promo, tab_extra = st.tabs([
@@ -1375,5 +1394,3 @@ with tab_extra:
             file_name=f"부가정보_등록결과_{datetime.now():%Y%m%d_%H%M%S}.csv",
             key="download_3",
         )
-
-
