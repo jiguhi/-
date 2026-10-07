@@ -1,24 +1,26 @@
 """
 그라펜 - 네이버 쇼핑검색광고 통합 관리 (Streamlit)
 
-네 개 기능을 하나의 UI(탭)로 통합:
+다섯 개 기능을 하나의 UI(탭)로 통합:
   1) 카테고리별 광고그룹 생성 & 상품 등록 - CSV 업로드 -> 카테고리별 광고그룹 생성 -> SHOPPING_PRODUCT_AD 소재 일괄 등록
   2) 홍보문구 등록 (그룹 단위) - PROMOTION 확장소재
   3) 부가정보 확장소재 등록 (소재 단위) - SHOPPING_EXTRA 확장소재
   4) 광고그룹 복사 - 그룹 설정 + 타겟팅 + 쇼핑상품 소재 + 홍보문구 + 제외키워드를 새 그룹으로 복사
+  5) 노출매체 설정 - 광고그룹 노출 매체 유형(검색/콘텐츠, 네이버/파트너) + 노출제한매체 일괄 변경
 
 실행:
     pip install -r requirements_streamlit.txt
     streamlit run 그라펜_확장소재_streamlit.py
 
 1번 탭의 "실행" 버튼은 실제로 광고그룹을 생성하고 소재를 등록합니다(라이브 API 호출).
-2/3/4번 탭은 "미리보기"(읽기 전용)를 먼저 돌려보고, 확인 체크박스를 켠 뒤 "실행" 버튼을 눌러야
+2/3/4/5번 탭은 "미리보기"(읽기 전용)를 먼저 돌려보고, 확인 체크박스를 켠 뒤 "실행" 버튼을 눌러야
 실제로 네이버에 반영됩니다.
 """
 
 import base64
 import hashlib
 import hmac
+import io
 import json
 import os
 import re
@@ -1406,6 +1408,173 @@ def run_adgroup_copy(
     return pd.DataFrame(rows)
 
 
+# =========================
+# 노출매체 설정 (MEDIA_TARGET) - 5번 탭용
+# =========================
+# 네이버 공식 매체 목록 (매체ID / 매체이름 ...). 노출제한매체(black.media)는 이 매체ID를 사용
+MEDIA_LIST_URL = "https://manage.searchad.naver.com/file/static/naver_ad_media.xlsx"
+NETWORK_LABELS = {"naver": "네이버", "partner": "파트너"}
+
+
+@st.cache_data(ttl=60 * 60 * 24, show_spinner=False)
+def load_media_list():
+    res = requests.get(MEDIA_LIST_URL, timeout=30)
+    res.raise_for_status()
+    df = pd.read_excel(io.BytesIO(res.content), header=2)
+    df = df[pd.to_numeric(df["매체ID"], errors="coerce").notna()].copy()
+    df["매체ID"] = df["매체ID"].astype(int)
+    return df
+
+
+def get_media_target(api_key, secret_key, customer_id, adgroup_id):
+    for t in get_targets(api_key, secret_key, customer_id, adgroup_id):
+        if t.get("targetTp") == "MEDIA_TARGET" and not t.get("delFlag"):
+            return t
+    return None
+
+
+def normalize_media_target(target):
+    """비교용 정규화. type 1(모든 매체)은 나머지 값이 의미 없음"""
+    target = target or {}
+    if target.get("type") == 1:
+        return {"type": 1}
+    black = target.get("black") or {}
+    white = target.get("white") or {}
+    return {
+        "type": target.get("type"),
+        "search": sorted(target.get("search") or []),
+        "contents": sorted(target.get("contents") or []),
+        "black_media": sorted(black.get("media") or []),
+        "black_group": sorted(black.get("mediaGroup") or []),
+        "white_media": sorted(white.get("media") or []),
+        "white_group": sorted(white.get("mediaGroup") or []),
+    }
+
+
+def describe_media_target(target, media_names):
+    t = normalize_media_target(target)
+    if t["type"] == 1:
+        return "모든 매체"
+    if t["type"] == 3:
+        return f"지정 매체만 노출 (매체 {len(t['white_media'])}개, 매체그룹 {len(t['white_group'])}개)"
+
+    parts = [
+        "검색: " + (", ".join(NETWORK_LABELS.get(n, n) for n in t["search"]) or "없음"),
+        "콘텐츠: " + (", ".join(NETWORK_LABELS.get(n, n) for n in t["contents"]) or "없음"),
+    ]
+    if t["black_media"]:
+        names = [media_names.get(m, f"ID {m}") for m in t["black_media"]]
+        parts.append(f"제한매체 {len(names)}개(" + ", ".join(names[:5]) + (" ..." if len(names) > 5 else "") + ")")
+    if t["black_group"]:
+        parts.append(f"제한 매체그룹 {len(t['black_group'])}개")
+    return " / ".join(parts)
+
+
+def build_media_target(current, change_network, all_media, search, contents, change_black, black_ids, black_mode):
+    """
+    현재 MEDIA_TARGET 값에 변경사항을 반영한 새 target 값.
+      - all_media=True  -> type 1 (모든 매체, 제한매체 없음)
+      - 그 외           -> type 2 (선택한 매체 유형 + 노출제한매체)
+    매체 유형을 안 바꾸면 현재 값을 유지 (현재가 모든 매체/지정매체면 검색·콘텐츠 전체로 간주)
+    """
+    current = current or {}
+    if change_network and all_media:
+        return {
+            "type": 1, "search": [], "contents": [],
+            "black": {"media": None, "mediaGroup": None},
+            "white": {"media": None, "mediaGroup": None},
+        }
+
+    if change_network:
+        new_search, new_contents = list(search), list(contents)
+    elif current.get("type") == 2:
+        new_search, new_contents = list(current.get("search") or []), list(current.get("contents") or [])
+    else:
+        new_search, new_contents = ["naver", "partner"], ["naver", "partner"]
+
+    cur_black = (current.get("black") or {}) if current.get("type") == 2 else {}
+    cur_media = list(cur_black.get("media") or [])
+    if not change_black:
+        new_media = cur_media
+    elif black_mode == "삭제":
+        new_media = [m for m in cur_media if m not in set(black_ids)]
+    elif black_mode == "교체":
+        new_media = sorted(set(black_ids))
+    else:
+        new_media = sorted(set(cur_media) | set(black_ids))
+
+    return {
+        "type": 2,
+        "search": new_search,
+        "contents": new_contents,
+        "black": {"media": new_media, "mediaGroup": list(cur_black.get("mediaGroup") or [])},
+        "white": {"media": None, "mediaGroup": None},
+    }
+
+
+def run_media_target(
+    api_key, secret_key, customer_id, groups, media_names,
+    change_network, all_media, search, contents, change_black, black_ids, black_mode,
+    dry_run, progress_cb=None,
+):
+    total = len(groups)
+    rows = []
+
+    for i, (campaign_name, ag) in enumerate(groups, 1):
+        adgroup_id = ag["nccAdgroupId"]
+        media_target = get_media_target(api_key, secret_key, customer_id, adgroup_id)
+        current = (media_target or {}).get("target")
+        new_target = build_media_target(
+            current, change_network, all_media, search, contents, change_black, black_ids, black_mode,
+        )
+
+        row = {
+            "캠페인": campaign_name,
+            "광고그룹": ag.get("name"),
+            "광고그룹ID": adgroup_id,
+            "현재": describe_media_target(current, media_names) if media_target else "(매체 타겟 없음)",
+            "변경후": describe_media_target(new_target, media_names),
+            "상태": "",
+            "메시지": "",
+        }
+
+        if media_target is None:
+            row["상태"] = "스킵"
+            row["메시지"] = "MEDIA_TARGET 조회 실패"
+        elif normalize_media_target(current) == normalize_media_target(new_target):
+            row["상태"] = "변경없음"
+        elif dry_run:
+            row["상태"] = "미리보기"
+        else:
+            body = {
+                "nccTargetId": media_target["nccTargetId"],
+                "ownerId": adgroup_id,
+                "targetTp": "MEDIA_TARGET",
+                "target": new_target,
+            }
+            res = api_request(
+                api_key, secret_key, customer_id, "PUT", f"/ncc/targets/{media_target['nccTargetId']}", json_data=body,
+            )
+            if res is None or not res.ok:
+                row["상태"] = "실패"
+                row["메시지"] = f"{res.status_code} / {res.text}" if res is not None else "응답 없음"
+            else:
+                time.sleep(REQUEST_DELAY)
+                applied = (get_media_target(api_key, secret_key, customer_id, adgroup_id) or {}).get("target")
+                if normalize_media_target(applied) == normalize_media_target(new_target):
+                    row["상태"] = "성공"
+                else:
+                    row["상태"] = "확인필요"
+                    row["메시지"] = "200 응답이지만 재조회 값이 다름: " + describe_media_target(applied, media_names)
+            time.sleep(REQUEST_DELAY)
+
+        rows.append(row)
+        if progress_cb:
+            progress_cb(i, total, f"{campaign_name} / {ag.get('name')} -> {row['상태']}")
+
+    return pd.DataFrame(rows)
+
+
 def make_progress(progress_bar, log_box):
     log_lines = []
 
@@ -1420,8 +1589,8 @@ def make_progress(progress_bar, log_box):
 # =========================
 # Streamlit UI
 # =========================
-st.set_page_config(page_title="쇼핑검색광고 통합 관리", layout="wide")
-st.title("쇼핑검색광고 통합 관리")
+st.set_page_config(page_title="그라펜 쇼핑검색광고 통합 관리", layout="wide")
+st.title("그라펜 쇼핑검색광고 통합 관리")
 
 st.warning("API Key/Secret Key는 화면 입력값으로만 사용하는 것을 권장합니다.")
 
@@ -1433,11 +1602,12 @@ with st.sidebar:
     customer_id = st.text_input("Customer ID", value=settings.get("customer_id", "")).strip()
     st.caption("대행사 키라 Customer ID만 바꾸면 다른 광고주 계정에도 그대로 쓸 수 있습니다.")
 
-tab_group, tab_promo, tab_extra, tab_copy = st.tabs([
+tab_group, tab_promo, tab_extra, tab_copy, tab_media = st.tabs([
     "카테고리별 광고그룹 생성 & 상품 등록",
     "홍보문구 등록 (광고그룹 단위)",
     "부가정보 확장소재 등록 (소재 단위)",
     "광고그룹 복사",
+    "노출매체 설정",
 ])
 
 # ---------- Tab 1: 카테고리별 광고그룹 생성 & 상품 등록 ----------
@@ -1865,4 +2035,199 @@ with tab_copy:
             df_copy.to_csv(index=False).encode("utf-8-sig"),
             file_name=f"광고그룹복사_결과_{datetime.now():%Y%m%d_%H%M%S}.csv",
             key="download_4",
+        )
+
+# ---------- Tab 5: 노출매체 설정 ----------
+with tab_media:
+    st.subheader("노출매체 설정 (노출 매체 유형 · 노출제한매체)")
+    st.caption(
+        "선택한 광고그룹의 노출 매체 유형(검색/콘텐츠 × 네이버/파트너)과 노출제한매체를 한 번에 바꿉니다. "
+        "바꾸지 않는 항목은 그룹별 현재 설정을 그대로 유지합니다."
+    )
+
+    try:
+        media_df = load_media_list()
+    except Exception as e:
+        media_df = pd.DataFrame(columns=["매체ID", "매체이름"])
+        st.warning(f"네이버 매체 목록을 불러오지 못했습니다 (매체ID 직접 입력은 가능): {e}")
+    media_names = dict(zip(media_df["매체ID"], media_df["매체이름"]))
+
+    if st.button("캠페인 목록 불러오기", key="load_campaigns_4"):
+        with st.spinner("캠페인 조회 중..."):
+            try:
+                st.session_state["campaigns_4"] = get_campaigns(api_key, secret_key, customer_id)
+            except Exception as e:
+                st.error(f"캠페인 조회 실패: {e}")
+
+    campaigns_4 = st.session_state.get("campaigns_4", [])
+    campaign_by_id_4 = {c["nccCampaignId"]: c for c in campaigns_4}
+    selected_campaign_ids_4 = st.multiselect(
+        "대상 캠페인 선택", list(campaign_by_id_4),
+        format_func=lambda cid: campaign_by_id_4[cid]["name"], key="selected_campaigns_4",
+    )
+
+    group_options_4 = {}
+    cache_4 = st.session_state.setdefault("adgroups_4", {})
+    for cid in selected_campaign_ids_4:
+        if cid not in cache_4:
+            try:
+                cache_4[cid] = get_adgroups_by_campaign(api_key, secret_key, customer_id, cid)
+            except Exception as e:
+                st.error(f"광고그룹 조회 실패: {e}")
+        for ag in cache_4.get(cid, []):
+            group_options_4[ag["nccAdgroupId"]] = (campaign_by_id_4[cid]["name"], ag)
+
+    selected_group_ids_4 = st.multiselect(
+        "광고그룹 선택 (비워두면 선택한 캠페인의 모든 광고그룹)", list(group_options_4),
+        format_func=lambda gid: f"{group_options_4[gid][0]} / {group_options_4[gid][1].get('name')}",
+        key="selected_groups_4",
+    )
+    target_groups_4 = [group_options_4[gid] for gid in (selected_group_ids_4 or list(group_options_4))]
+    if group_options_4:
+        st.caption(f"대상 광고그룹 {len(target_groups_4)}개")
+
+    st.markdown("**1. 노출 매체 유형**")
+    change_network_4 = st.checkbox("노출 매체 유형 변경", value=True, key="change_network_4")
+    all_media_4, search_4, contents_4 = False, [], []
+    if change_network_4:
+        media_mode_4 = st.radio(
+            "노출 매체", ["모든 매체", "노출 매체 유형 선택"], index=1, horizontal=True, key="media_mode_4",
+        )
+        all_media_4 = media_mode_4 == "모든 매체"
+        if not all_media_4:
+            col_s, col_c = st.columns(2)
+            with col_s:
+                st.write("검색 매체")
+                if st.checkbox("네이버 및 검색 포털", value=True, key="search_naver_4"):
+                    search_4.append("naver")
+                if st.checkbox("파트너", value=True, key="search_partner_4"):
+                    search_4.append("partner")
+            with col_c:
+                st.write("콘텐츠 매체")
+                if st.checkbox("네이버", value=True, key="contents_naver_4"):
+                    contents_4.append("naver")
+                if st.checkbox("파트너", value=True, key="contents_partner_4"):
+                    contents_4.append("partner")
+            if not search_4 and not contents_4:
+                st.error("검색 매체나 콘텐츠 매체를 하나 이상 선택해주세요.")
+
+    st.markdown("**2. 노출제한매체**")
+    change_black_4 = st.checkbox("노출제한매체 변경", value=False, key="change_black_4", disabled=all_media_4)
+    black_ids_4, black_mode_4, remove_all_4 = [], "추가", False
+    if all_media_4:
+        st.caption("'모든 매체'를 선택하면 노출제한매체는 설정할 수 없습니다.")
+    elif change_black_4:
+        black_mode_4 = st.radio(
+            "적용 방식", ["추가", "삭제", "교체"], horizontal=True, key="black_mode_4",
+            help=(
+                "추가: 그룹별 기존 제한매체는 유지하고 선택한 매체를 더함 / "
+                "삭제: 그룹별 기존 제한매체에서 선택한 매체만 뺌 / "
+                "교체: 선택한 매체로 통째로 바꿈"
+            ),
+        )
+
+        if black_mode_4 == "삭제":
+            if st.button("대상 그룹의 현재 노출제한매체 불러오기", key="load_current_black_4", disabled=not target_groups_4):
+                counter = defaultdict(int)
+                with st.spinner("조회 중..."):
+                    for _, ag in target_groups_4:
+                        target = (get_media_target(api_key, secret_key, customer_id, ag["nccAdgroupId"]) or {}).get("target") or {}
+                        for m in (target.get("black") or {}).get("media") or []:
+                            counter[m] += 1
+                st.session_state["current_black_4"] = dict(counter)
+            current_black_4 = st.session_state.get("current_black_4", {})
+
+            remove_all_4 = st.checkbox("노출제한매체 전부 삭제", key="remove_all_black_4")
+            if remove_all_4:
+                # 빈 목록으로 교체 = 전부 해제
+                black_mode_4, black_ids_4 = "교체", []
+            else:
+                # 현재 걸려있는 매체(많이 쓰인 순) 먼저, 그 다음 공식 목록
+                options_4 = sorted(current_black_4, key=lambda m: -current_black_4[m])
+                options_4 += [m for m in media_names if m not in current_black_4]
+                black_ids_4 = st.multiselect(
+                    "삭제할 매체", options_4,
+                    format_func=lambda mid: (
+                        f"{media_names.get(mid, '목록에 없는 매체')} ({mid})"
+                        + (f" - {current_black_4[mid]}개 그룹" if mid in current_black_4 else "")
+                    ),
+                    key="remove_black_media_4",
+                    help="'현재 노출제한매체 불러오기'를 누르면 대상 그룹에 실제로 걸려있는 매체가 위쪽에 표시됩니다.",
+                )
+        else:
+            # 네이버 공식 매체 목록에 없는 매체(예: 플러스스토어)는 광고센터에서 한 그룹에 직접 걸어두고 여기서 가져옴
+            ref_group_id_4 = st.selectbox(
+                "기준 광고그룹의 노출제한매체 가져오기 (선택사항)", [None] + list(group_options_4),
+                format_func=lambda gid: "선택 안 함" if gid is None else f"{group_options_4[gid][0]} / {group_options_4[gid][1].get('name')}",
+                key="ref_group_4",
+                help="공식 매체 목록에 없는 매체(플러스스토어 등)는 광고센터에서 그룹 하나에 노출제한을 걸어두고, 그 그룹을 기준으로 선택하세요.",
+            )
+            ref_ids_4 = []
+            if ref_group_id_4:
+                ref_cache_4 = st.session_state.setdefault("ref_black_4", {})
+                if ref_group_id_4 not in ref_cache_4:
+                    ref_target = (get_media_target(api_key, secret_key, customer_id, ref_group_id_4) or {}).get("target") or {}
+                    ref_cache_4[ref_group_id_4] = list((ref_target.get("black") or {}).get("media") or [])
+                ref_ids_4 = ref_cache_4[ref_group_id_4]
+                st.caption(
+                    f"기준 그룹 노출제한매체 {len(ref_ids_4)}개: "
+                    + (", ".join(media_names.get(m, f"목록에 없는 매체({m})") for m in ref_ids_4) or "없음")
+                )
+
+            black_ids_4 = list(ref_ids_4) + st.multiselect(
+                "노출을 제한할 매체", list(media_names),
+                format_func=lambda mid: f"{media_names[mid]} ({mid})", key="black_media_4",
+            )
+
+        if not remove_all_4:
+            extra_ids_4 = st.text_input("목록에 없는 매체ID 직접 입력 (쉼표로 구분)", key="black_media_extra_4")
+            black_ids_4 += [int(x) for x in re.findall(r"\d+", extra_ids_4)]
+
+    valid_network_4 = (not change_network_4) or all_media_4 or bool(search_4 or contents_4)
+    ready_4 = bool(target_groups_4 and (change_network_4 or change_black_4) and valid_network_4)
+    media_args_4 = dict(
+        groups=target_groups_4,
+        media_names=media_names,
+        change_network=change_network_4,
+        all_media=all_media_4,
+        search=search_4,
+        contents=contents_4,
+        change_black=change_black_4,
+        black_ids=black_ids_4,
+        black_mode=black_mode_4,
+    )
+
+    if st.button("🔍 미리보기 (실제 변경 안 함)", key="preview_4", disabled=not ready_4):
+        progress_bar = st.progress(0)
+        log_box = st.empty()
+        with st.spinner("조회 중..."):
+            df_media = run_media_target(
+                api_key, secret_key, customer_id, **media_args_4,
+                dry_run=True, progress_cb=make_progress(progress_bar, log_box),
+            )
+        st.session_state["preview_df_4"] = df_media
+
+    if "preview_df_4" in st.session_state:
+        st.dataframe(st.session_state["preview_df_4"], use_container_width=True)
+
+    confirm_4 = st.checkbox("실제로 네이버 광고그룹 노출매체를 변경합니다 (라이브 API 호출)", key="confirm_4")
+    if st.button("🚀 실행 (실제 변경)", key="run_4", disabled=not (ready_4 and confirm_4)):
+        progress_bar = st.progress(0)
+        log_box = st.empty()
+        with st.spinner("변경 중..."):
+            df_media = run_media_target(
+                api_key, secret_key, customer_id, **media_args_4,
+                dry_run=False, progress_cb=make_progress(progress_bar, log_box),
+            )
+        st.session_state["result_df_4"] = df_media
+        st.success("완료!")
+
+    if "result_df_4" in st.session_state:
+        df_media = st.session_state["result_df_4"]
+        st.dataframe(df_media, use_container_width=True)
+        st.download_button(
+            "결과 CSV 다운로드",
+            df_media.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"노출매체_변경결과_{datetime.now():%Y%m%d_%H%M%S}.csv",
+            key="download_5",
         )
