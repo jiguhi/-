@@ -1061,8 +1061,8 @@ def make_progress(progress_bar, log_box):
 # =========================
 # Streamlit UI
 # =========================
-st.set_page_config(page_title="그라펜 쇼핑검색광고 통합 관리", layout="wide")
-st.title("그라펜 쇼핑검색광고 통합 관리")
+st.set_page_config(page_title="쇼핑검색광고 통합 관리", layout="wide")
+st.title("쇼핑검색광고 통합 관리")
 
 st.warning("API Key/Secret Key는 화면 입력값으로만 사용하는 것을 권장합니다.")
 
