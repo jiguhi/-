@@ -1,17 +1,18 @@
 """
 그라펜 - 네이버 쇼핑검색광고 통합 관리 (Streamlit)
 
-세 개 기능을 하나의 UI(탭)로 통합:
+네 개 기능을 하나의 UI(탭)로 통합:
   1) 카테고리별 광고그룹 생성 & 상품 등록 - CSV 업로드 -> 카테고리별 광고그룹 생성 -> SHOPPING_PRODUCT_AD 소재 일괄 등록
   2) 홍보문구 등록 (그룹 단위) - PROMOTION 확장소재
   3) 부가정보 확장소재 등록 (소재 단위) - SHOPPING_EXTRA 확장소재
+  4) 광고그룹 복사 - 그룹 설정 + 타겟팅 + 쇼핑상품 소재 + 홍보문구 + 제외키워드를 새 그룹으로 복사
 
 실행:
     pip install -r requirements_streamlit.txt
     streamlit run 그라펜_확장소재_streamlit.py
 
 1번 탭의 "실행" 버튼은 실제로 광고그룹을 생성하고 소재를 등록합니다(라이브 API 호출).
-2/3번 탭은 "미리보기"(읽기 전용)를 먼저 돌려보고, 확인 체크박스를 켠 뒤 "실행" 버튼을 눌러야
+2/3/4번 탭은 "미리보기"(읽기 전용)를 먼저 돌려보고, 확인 체크박스를 켠 뒤 "실행" 버튼을 눌러야
 실제로 네이버에 반영됩니다.
 """
 
@@ -1047,6 +1048,364 @@ def run_shopping_extra(api_key, secret_key, customer_id, campaigns, dry_run, pro
     return pd.DataFrame(rows)
 
 
+# =========================
+# 광고그룹 복사 - 4번 탭용
+# =========================
+# 원본 그룹에서 그대로 가져올 설정 필드 (원본에 값이 있는 것만 복사)
+ADGROUP_COPY_FIELDS = [
+    "adgroupType", "bidAmt", "contentsNetworkBidAmt", "useCntsNetworkBidAmt",
+    "contentsNetworkBidWeight", "pcNetworkBidWeight", "mobileNetworkBidWeight",
+    "dailyBudget", "useDailyBudget", "pcChannelId", "mobileChannelId",
+]
+
+
+# 매체 / PC·모바일 등 (/ncc/targets) 한글 표시명
+TARGET_LABELS = {
+    "MEDIA_TARGET": "매체",
+    "PC_MOBILE_TARGET": "PC/모바일",
+    "NON_SEARCH_KEYWORD_TARGET": "검색어없는노출",
+}
+# 제외키워드는 restricted-keywords API로 따로 복사
+SKIP_TARGET_TYPES = {"RESTRICT_KEYWORD_TARGET"}
+
+# 요일/시간·지역·성별·연령 등 (/ncc/criterion) 한글 표시명
+CRITERION_LABELS = {
+    "SD": "요일/시간",
+    "RL": "지역",
+    "RP": "반경",
+    "AG": "연령",
+    "GN": "성별",
+    "AD": "이용자세그먼트",
+    "DV": "기기",
+}
+
+
+def target_label(target_tp):
+    return TARGET_LABELS.get(target_tp, target_tp)
+
+
+def criterion_label(criterion_type):
+    return CRITERION_LABELS.get(criterion_type, criterion_type)
+
+
+def get_targets(api_key, secret_key, customer_id, owner_id):
+    res = api_request(api_key, secret_key, customer_id, "GET", "/ncc/targets", params={"ownerId": owner_id})
+    if not res.ok:
+        return []
+    return res.json()
+
+
+def get_copyable_targets(targets):
+    return [
+        {"targetTp": t["targetTp"], "target": t.get("target")}
+        for t in targets
+        if not t.get("delFlag") and t.get("targetTp") not in SKIP_TARGET_TYPES
+    ]
+
+
+def find_target_mismatches(source_targets, new_targets):
+    """원본과 target 값이 다른(또는 없는) 타겟 종류 목록"""
+    new_map = {t.get("targetTp"): t.get("target") for t in new_targets if not t.get("delFlag")}
+    return [s["targetTp"] for s in source_targets if new_map.get(s["targetTp"]) != s["target"]]
+
+
+def copy_targets(api_key, secret_key, customer_id, new_adgroup_id, source_targets):
+    """
+    매체 / PC·모바일 타겟을 원본과 같게 맞춥니다 (PUT /ncc/targets/{id}) -> 다시 조회해서 검증.
+    반환: (원본과 다른 타겟 종류 리스트, 에러 메시지 리스트)
+    """
+    errors = []
+    new_targets = get_targets(api_key, secret_key, customer_id, new_adgroup_id)
+    new_map = {t["targetTp"]: t for t in new_targets}
+
+    for tp in find_target_mismatches(source_targets, new_targets):
+        if tp not in new_map:
+            continue
+        body = dict(new_map[tp])
+        body["target"] = next(s["target"] for s in source_targets if s["targetTp"] == tp)
+        res = api_request(
+            api_key, secret_key, customer_id, "PUT", f"/ncc/targets/{body['nccTargetId']}", json_data=body,
+        )
+        if res is None or not res.ok:
+            errors.append(f"{target_label(tp)}: {res.status_code} / {res.text}" if res is not None else f"{target_label(tp)}: 응답 없음")
+        time.sleep(REQUEST_DELAY)
+
+    missing = find_target_mismatches(source_targets, get_targets(api_key, secret_key, customer_id, new_adgroup_id))
+    return missing, errors
+
+
+def get_criteria(api_key, secret_key, customer_id, adgroup_id):
+    res = api_request(api_key, secret_key, customer_id, "GET", f"/ncc/criterion/{adgroup_id}")
+    if not res.ok:
+        return []
+    return [c for c in res.json() if not c.get("delFlag")]
+
+
+def group_criteria_by_type(criteria):
+    by_type = defaultdict(list)
+    for c in criteria:
+        by_type[c.get("type")].append(c)
+    return dict(by_type)
+
+
+def criterion_signature(criteria):
+    """비교용: 사용중인 코드별 (코드, 가중치, 노출제외). 반경(RP)은 서버가 코드를 새로 주므로 value로 비교"""
+    return sorted(
+        (c.get("value") if c.get("type") == "RP" else c.get("dictionaryCode"), c.get("bidWeight"), bool(c.get("negative")))
+        for c in criteria if c.get("enable")
+    )
+
+
+def copy_criteria(api_key, secret_key, customer_id, new_adgroup_id, source_criteria):
+    """
+    요일/시간·지역·성별·연령 등 Criterion 타겟팅을 종류별로 통째로 덮어씁니다.
+    PUT /ncc/criterion/{광고그룹ID}/{type} : 요청에 없는 코드는 '사용안함' 처리됨 -> 원본 목록 그대로 전송.
+    이후 다시 조회해서 원본과 비교.
+    반환: (원본과 다른 종류 리스트, 에러 메시지 리스트)
+    """
+    errors = []
+    source_by_type = group_criteria_by_type(source_criteria)
+
+    for c_type, items in source_by_type.items():
+        payload = [
+            {
+                "dictionaryCode": "Proximity" if c_type == "RP" else c.get("dictionaryCode"),
+                "ownerId": new_adgroup_id,
+                "customerId": int(customer_id),
+                "type": c_type,
+                "value": c.get("value"),
+                "bidWeight": c.get("bidWeight"),
+                "negative": bool(c.get("negative")),
+                "enable": bool(c.get("enable")),
+            }
+            for c in items
+        ]
+        res = api_request(
+            api_key, secret_key, customer_id, "PUT", f"/ncc/criterion/{new_adgroup_id}/{c_type}", json_data=payload,
+        )
+        if res is None or not res.ok:
+            errors.append(f"{criterion_label(c_type)}: {res.status_code} / {res.text}" if res is not None else f"{criterion_label(c_type)}: 응답 없음")
+        time.sleep(REQUEST_DELAY)
+
+    new_by_type = group_criteria_by_type(get_criteria(api_key, secret_key, customer_id, new_adgroup_id))
+    missing = [
+        c_type for c_type, items in source_by_type.items()
+        if criterion_signature(items) != criterion_signature(new_by_type.get(c_type, []))
+    ]
+    return missing, errors
+
+
+def get_restricted_keywords(api_key, secret_key, customer_id, adgroup_id):
+    res = api_request(api_key, secret_key, customer_id, "GET", f"/ncc/adgroups/{adgroup_id}/restricted-keywords")
+    if not res.ok:
+        return []
+    return res.json()
+
+
+def add_restricted_keywords(api_key, secret_key, customer_id, adgroup_id, source_keywords):
+    payload = [
+        {"nccAdgroupId": adgroup_id, "keyword": kw.get("keyword"), "type": kw.get("type")}
+        for kw in source_keywords
+    ]
+    return api_request(
+        api_key, secret_key, customer_id, "POST",
+        f"/ncc/adgroups/{adgroup_id}/restricted-keywords", json_data=payload,
+    )
+
+
+def make_copy_group_name(source_name, suffix, used_names):
+    """원본그룹명 + 접미사 (최대 30자). 이미 있는 이름이면 뒤에 2, 3 번호를 붙입니다."""
+    base_name = str(source_name)[:MAX_GROUP_NAME_LENGTH - len(suffix)] + suffix
+    name = base_name
+    number = 2
+    while name in used_names:
+        name = make_group_name_with_suffix(base_name, number)
+        number += 1
+    return name
+
+
+def create_copied_adgroup(api_key, secret_key, customer_id, source_ag, target_campaign_id, new_name, lock):
+    payload = {k: source_ag[k] for k in ADGROUP_COPY_FIELDS if source_ag.get(k) is not None}
+    payload.update({"name": new_name, "nccCampaignId": target_campaign_id, "userLock": bool(lock)})
+    return api_request(api_key, secret_key, customer_id, "POST", "/ncc/adgroups", json_data=payload)
+
+
+def make_copied_ad_payload(adgroup_id, source_ad):
+    src_attr = source_ad.get("adAttr") or {}
+    ad_attr = {"useGroupBidAmt": src_attr.get("useGroupBidAmt", True)}
+    if src_attr.get("bidAmt") is not None:
+        ad_attr["bidAmt"] = src_attr["bidAmt"]
+    return {
+        "nccAdgroupId": adgroup_id,
+        "type": "SHOPPING_PRODUCT_AD",
+        "referenceKey": str(source_ad.get("referenceKey", "")).strip(),
+        "ad": {},
+        "adAttr": ad_attr,
+        "userLock": bool(source_ad.get("userLock", False)),
+    }
+
+
+def copy_shopping_ads(api_key, secret_key, customer_id, new_adgroup_id, source_ads, batch_size=BATCH_SIZE):
+    """
+    SHOPPING_PRODUCT_AD 소재를 새 그룹에 배치 등록합니다. 배치 실패 시 개별 재시도.
+    반환: (생성된 소재 리스트, 실패 메시지 리스트)
+    """
+    created, failed = [], []
+    for start in range(0, len(source_ads), batch_size):
+        batch = source_ads[start:start + batch_size]
+        payload = [make_copied_ad_payload(new_adgroup_id, ad) for ad in batch]
+        res = api_request(api_key, secret_key, customer_id, "POST", "/ncc/ads?isList=true", json_data=payload)
+
+        if res is not None and res.ok:
+            created.extend(res.json())
+            time.sleep(0.1)
+            continue
+
+        for item in payload:
+            single_res = api_request(
+                api_key, secret_key, customer_id, "POST", "/ncc/ads?isList=true", json_data=[item],
+            )
+            if single_res is not None and single_res.ok:
+                created.extend(single_res.json())
+            else:
+                msg = f"{single_res.status_code} / {single_res.text}" if single_res is not None else "응답 없음"
+                failed.append(f"{item['referenceKey']}: {msg}")
+            time.sleep(0.1)
+
+    return created, failed
+
+
+def run_adgroup_copy(
+    api_key, secret_key, customer_id, source_groups, target_campaign, suffix,
+    copy_ads, copy_promotion, copy_restricted, apply_extra, lock_new_group,
+    dry_run, progress_cb=None, copy_target=True,
+):
+    target_campaign_id = target_campaign["nccCampaignId"]
+    used_names = {
+        ag.get("name") for ag in get_adgroups_by_campaign(api_key, secret_key, customer_id, target_campaign_id)
+    }
+
+    total = len(source_groups)
+    rows = []
+
+    for i, (campaign_name, ag) in enumerate(source_groups, 1):
+        source_id = ag["nccAdgroupId"]
+        new_name = make_copy_group_name(ag.get("name", ""), suffix, used_names)
+        used_names.add(new_name)
+
+        ads = get_ads_in_group(api_key, secret_key, customer_id, source_id) if copy_ads else []
+        product_ads = [a for a in ads if a.get("type") == "SHOPPING_PRODUCT_AD"]
+        skipped_ads = len(ads) - len(product_ads)
+
+        group_exts = get_ad_extensions_by_owner(api_key, secret_key, customer_id, source_id) if copy_promotion else []
+        promotions = [e for e in group_exts if e.get("type") == "PROMOTION"]
+        other_ext_types = sorted({e.get("type") for e in group_exts if e.get("type") != "PROMOTION"})
+
+        restricted = get_restricted_keywords(api_key, secret_key, customer_id, source_id) if copy_restricted else []
+
+        source_targets = get_copyable_targets(get_targets(api_key, secret_key, customer_id, source_id)) if copy_target else []
+        source_criteria = get_criteria(api_key, secret_key, customer_id, source_id) if copy_target else []
+
+        row = {
+            "원본캠페인": campaign_name,
+            "원본그룹": ag.get("name"),
+            "원본그룹ID": source_id,
+            "대상캠페인": target_campaign["name"],
+            "새 그룹명": new_name,
+            "새 그룹ID": "",
+            "소재": len(product_ads),
+            "홍보문구": len(promotions),
+            "제외키워드": len(restricted),
+            "타겟팅": ", ".join(
+                [criterion_label(t) for t in group_criteria_by_type(source_criteria)]
+                + [target_label(t["targetTp"]) for t in source_targets]
+            ),
+            "상태": "미리보기" if dry_run else "",
+            "메시지": "",
+        }
+
+        notes = []
+        if skipped_ads:
+            notes.append(f"쇼핑상품 외 소재 {skipped_ads}개는 복사 안 함")
+        if other_ext_types:
+            notes.append(f"홍보문구 외 그룹 확장소재({', '.join(other_ext_types)})는 복사 안 함")
+
+        if not dry_run:
+            res = create_copied_adgroup(
+                api_key, secret_key, customer_id, ag, target_campaign_id, new_name, lock_new_group,
+            )
+            if res is None or not res.ok:
+                row["상태"] = "실패"
+                notes.insert(0, f"그룹 생성 실패: {res.status_code} / {res.text}" if res is not None else "그룹 생성 응답 없음")
+                row["메시지"] = " | ".join(notes)
+                rows.append(row)
+                if progress_cb:
+                    progress_cb(i, total, f"{ag.get('name')} -> 그룹 생성 실패")
+                time.sleep(REQUEST_DELAY)
+                continue
+
+            new_id = res.json().get("nccAdgroupId")
+            row["새 그룹ID"] = new_id
+            partial = False
+            time.sleep(REQUEST_DELAY)
+
+            if source_targets or source_criteria:
+                criteria_missing, criteria_errors = copy_criteria(api_key, secret_key, customer_id, new_id, source_criteria)
+                target_missing, target_errors = copy_targets(api_key, secret_key, customer_id, new_id, source_targets)
+                missing_labels = [criterion_label(t) for t in criteria_missing] + [target_label(t) for t in target_missing]
+                if missing_labels:
+                    partial = True
+                    notes.append("타겟팅 복사 안 됨: " + ", ".join(missing_labels))
+                    if criteria_errors or target_errors:
+                        notes.append("타겟팅 오류: " + "; ".join(criteria_errors + target_errors))
+                else:
+                    notes.append("타겟팅 복사 확인")
+
+            created_ads = []
+            if product_ads:
+                created_ads, failed_ads = copy_shopping_ads(api_key, secret_key, customer_id, new_id, product_ads)
+                notes.append(f"소재 {len(created_ads)}/{len(product_ads)}개 복사")
+                if failed_ads:
+                    partial = True
+                    notes.append("소재 실패: " + "; ".join(failed_ads[:5]) + (" ..." if len(failed_ads) > 5 else ""))
+
+            for p in promotions:
+                text1, text2 = get_promotion_texts(p)
+                p_res = create_promotion(api_key, secret_key, customer_id, new_id, text1, text2)
+                if p_res is None or not p_res.ok:
+                    partial = True
+                    notes.append(f"홍보문구 실패: {p_res.status_code} / {p_res.text}" if p_res is not None else "홍보문구 응답 없음")
+                time.sleep(REQUEST_DELAY)
+
+            if restricted:
+                r_res = add_restricted_keywords(api_key, secret_key, customer_id, new_id, restricted)
+                if r_res is None or not r_res.ok:
+                    partial = True
+                    notes.append(f"제외키워드 실패: {r_res.status_code} / {r_res.text}" if r_res is not None else "제외키워드 응답 없음")
+                time.sleep(REQUEST_DELAY)
+
+            if apply_extra and created_ads:
+                extra_fail = 0
+                for ad in created_ads:
+                    e_res = apply_shopping_product_info(api_key, secret_key, customer_id, ad.get("nccAdId"))
+                    if e_res is None or not e_res.ok:
+                        extra_fail += 1
+                    time.sleep(REQUEST_DELAY)
+                if extra_fail:
+                    partial = True
+                    notes.append(f"부가정보 실패 {extra_fail}개")
+
+            row["상태"] = "부분성공" if partial else "성공"
+
+        row["메시지"] = " | ".join(notes)
+        rows.append(row)
+
+        if progress_cb:
+            progress_cb(i, total, f"{ag.get('name')} -> {new_name} {row['상태']}")
+
+    return pd.DataFrame(rows)
+
+
 def make_progress(progress_bar, log_box):
     log_lines = []
 
@@ -1061,8 +1420,8 @@ def make_progress(progress_bar, log_box):
 # =========================
 # Streamlit UI
 # =========================
-st.set_page_config(page_title="쇼핑검색광고 통합 관리", layout="wide")
-st.title("쇼핑검색광고 통합 관리")
+st.set_page_config(page_title="그라펜 쇼핑검색광고 통합 관리", layout="wide")
+st.title("그라펜 쇼핑검색광고 통합 관리")
 
 st.warning("API Key/Secret Key는 화면 입력값으로만 사용하는 것을 권장합니다.")
 
@@ -1074,10 +1433,11 @@ with st.sidebar:
     customer_id = st.text_input("Customer ID", value=settings.get("customer_id", "")).strip()
     st.caption("대행사 키라 Customer ID만 바꾸면 다른 광고주 계정에도 그대로 쓸 수 있습니다.")
 
-tab_group, tab_promo, tab_extra = st.tabs([
+tab_group, tab_promo, tab_extra, tab_copy = st.tabs([
     "카테고리별 광고그룹 생성 & 상품 등록",
     "홍보문구 등록 (광고그룹 단위)",
     "부가정보 확장소재 등록 (소재 단위)",
+    "광고그룹 복사",
 ])
 
 # ---------- Tab 1: 카테고리별 광고그룹 생성 & 상품 등록 ----------
@@ -1393,4 +1753,116 @@ with tab_extra:
             df_extra.to_csv(index=False).encode("utf-8-sig"),
             file_name=f"부가정보_등록결과_{datetime.now():%Y%m%d_%H%M%S}.csv",
             key="download_3",
+        )
+
+# ---------- Tab 4: 광고그룹 복사 ----------
+with tab_copy:
+    st.subheader("광고그룹 복사")
+    st.caption(
+        "선택한 광고그룹의 설정(입찰가/예산/채널)을 그대로 새 광고그룹으로 만들고, "
+        "쇼핑상품 소재 · 홍보문구 · 제외키워드 · 타겟팅(요일/시간, 성별 등)을 함께 복사합니다. 원본 그룹은 건드리지 않습니다."
+    )
+
+    if st.button("캠페인 목록 불러오기", key="load_campaigns_3"):
+        with st.spinner("캠페인 조회 중..."):
+            try:
+                st.session_state["campaigns_3"] = get_campaigns(api_key, secret_key, customer_id)
+            except Exception as e:
+                st.error(f"캠페인 조회 실패: {e}")
+
+    campaigns_3 = st.session_state.get("campaigns_3", [])
+    campaign_by_id_3 = {c["nccCampaignId"]: c for c in campaigns_3}
+
+    col1, col2 = st.columns(2)
+    with col1:
+        source_campaign_id = st.selectbox(
+            "원본 캠페인", list(campaign_by_id_3), index=None,
+            format_func=lambda cid: campaign_by_id_3[cid]["name"], key="source_campaign_3",
+        )
+    with col2:
+        target_campaign_id = st.selectbox(
+            "복사해 넣을 캠페인", list(campaign_by_id_3), index=None,
+            format_func=lambda cid: campaign_by_id_3[cid]["name"], key="target_campaign_3",
+        )
+
+    source_groups_3 = []
+    if source_campaign_id:
+        cache = st.session_state.setdefault("adgroups_3", {})
+        if source_campaign_id not in cache:
+            try:
+                cache[source_campaign_id] = get_adgroups_by_campaign(api_key, secret_key, customer_id, source_campaign_id)
+            except Exception as e:
+                st.error(f"광고그룹 조회 실패: {e}")
+        adgroups_3 = cache.get(source_campaign_id, [])
+        adgroup_by_id_3 = {ag["nccAdgroupId"]: ag for ag in adgroups_3}
+
+        selected_group_ids = st.multiselect(
+            "복사할 광고그룹 선택", list(adgroup_by_id_3),
+            format_func=lambda gid: f"{adgroup_by_id_3[gid].get('name')} ({gid})", key="selected_groups_3",
+        )
+        source_campaign_name = campaign_by_id_3[source_campaign_id]["name"]
+        source_groups_3 = [(source_campaign_name, adgroup_by_id_3[gid]) for gid in selected_group_ids]
+
+    suffix_3 = st.text_input("새 그룹명 뒤에 붙일 문구", value="_복사", key="suffix_3")
+
+    col_o1, col_o2, col_o3 = st.columns(3)
+    with col_o1:
+        copy_ads_3 = st.checkbox("쇼핑상품 소재 복사", value=True, key="copy_ads_3")
+        copy_promo_3 = st.checkbox("홍보문구 복사", value=True, key="copy_promo_3")
+    with col_o2:
+        copy_restricted_3 = st.checkbox("제외키워드 복사", value=True, key="copy_restricted_3")
+        copy_target_3 = st.checkbox("타겟팅 복사 (요일/시간·지역·성별·연령·매체·PC/모바일)", value=True, key="copy_target_3")
+        apply_extra_3 = st.checkbox("복사한 소재에 부가정보 켜기", value=False, key="apply_extra_3")
+    with col_o3:
+        lock_3 = st.checkbox("새 그룹은 OFF 상태로 생성", value=True, key="lock_3")
+
+    if source_campaign_id and source_campaign_id == target_campaign_id and copy_ads_3:
+        st.warning("원본과 같은 캠페인에 복사하면 같은 상품이 한 캠페인 안에 중복 등록됩니다.")
+
+    ready_3 = bool(source_groups_3 and target_campaign_id and suffix_3)
+    copy_args_3 = dict(
+        source_groups=source_groups_3,
+        target_campaign=campaign_by_id_3.get(target_campaign_id),
+        suffix=suffix_3,
+        copy_ads=copy_ads_3,
+        copy_promotion=copy_promo_3,
+        copy_restricted=copy_restricted_3,
+        copy_target=copy_target_3,
+        apply_extra=apply_extra_3,
+        lock_new_group=lock_3,
+    )
+
+    if st.button("🔍 미리보기 (실제 복사 안 함)", key="preview_3", disabled=not ready_3):
+        progress_bar = st.progress(0)
+        log_box = st.empty()
+        with st.spinner("조회 중..."):
+            df_copy = run_adgroup_copy(
+                api_key, secret_key, customer_id, **copy_args_3,
+                dry_run=True, progress_cb=make_progress(progress_bar, log_box),
+            )
+        st.session_state["preview_df_3"] = df_copy
+
+    if "preview_df_3" in st.session_state:
+        st.dataframe(st.session_state["preview_df_3"], use_container_width=True)
+
+    confirm_3 = st.checkbox("실제로 네이버에 새 광고그룹을 만듭니다 (라이브 API 호출)", key="confirm_3")
+    if st.button("🚀 실행 (실제 복사)", key="run_3", disabled=not (ready_3 and confirm_3)):
+        progress_bar = st.progress(0)
+        log_box = st.empty()
+        with st.spinner("복사 중... (소재 수가 많으면 시간이 걸릴 수 있어요)"):
+            df_copy = run_adgroup_copy(
+                api_key, secret_key, customer_id, **copy_args_3,
+                dry_run=False, progress_cb=make_progress(progress_bar, log_box),
+            )
+        st.session_state["result_df_3"] = df_copy
+        st.success("완료!")
+
+    if "result_df_3" in st.session_state:
+        df_copy = st.session_state["result_df_3"]
+        st.dataframe(df_copy, use_container_width=True)
+        st.download_button(
+            "결과 CSV 다운로드",
+            df_copy.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"광고그룹복사_결과_{datetime.now():%Y%m%d_%H%M%S}.csv",
+            key="download_4",
         )
