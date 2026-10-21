@@ -114,12 +114,34 @@ def api_request(api_key, secret_key, customer_id, method, uri, params=None, json
 # 상품 / 카테고리 처리 (1번 탭용)
 # =========================
 def get_col(row, keyword):
+    """열 이름이 정확히 같은 열을 먼저 찾고, 없으면 키워드가 포함된 열을 찾습니다. (공백 무시)"""
     keyword_clean = keyword.replace(" ", "")
+    for col in row.index:
+        if str(col).replace(" ", "") == keyword_clean:
+            return row.get(col, "")
     for col in row.index:
         col_clean = str(col).replace(" ", "")
         if keyword_clean in col_clean:
             return row.get(col, "")
     return ""
+
+
+def get_id_col(row, keyword):
+    """상품번호/ID 값을 문자열로 반환합니다. 빈 값·nan은 "", 엑셀 숫자 변환으로 붙은 .0은 제거."""
+    value = str(get_col(row, keyword)).strip()
+    if value.lower() == "nan":
+        return ""
+    if value.endswith(".0") and value[:-2].isdigit():
+        value = value[:-2]
+    return value
+
+
+# 소재 등록 번호 우선순위: 앞 열 값이 비어 있으면 다음 열 값을 사용
+SHOPPING_PRODUCT_NO_COLUMNS = [
+    "네이버쇼핑상품번호(스마트스토어)",
+    "네이버가격비교상품ID",
+    "상품번호(스마트스토어)",
+]
 
 
 CATEGORY_LEVEL_KEYS = {
@@ -188,11 +210,11 @@ def load_products_from_df(df, category_level="소분류"):
 
     products = []
     for _, row in df.iterrows():
-        shopping_product_no = str(get_col(row, "네이버쇼핑상품번호(스마트스토어)")).strip()
-        if not shopping_product_no or shopping_product_no.lower() == "nan":
-            shopping_product_no = str(get_col(row, "상품번호(스마트스토어)")).strip()
+        shopping_product_no = next(
+            (v for v in (get_id_col(row, c) for c in SHOPPING_PRODUCT_NO_COLUMNS) if v), ""
+        )
 
-        product_no = str(get_col(row, "상품번호(스마트스토어)")).strip()
+        product_no = get_id_col(row, "상품번호(스마트스토어)")
         product_name = str(row.get("상품명", "")).strip()
         category_name = make_category_name(row, category_level)
 
@@ -1589,8 +1611,8 @@ def make_progress(progress_bar, log_box):
 # =========================
 # Streamlit UI
 # =========================
-st.set_page_config(page_title="쇼핑검색광고 통합 관리", layout="wide")
-st.title("쇼핑검색광고 통합 관리")
+st.set_page_config(page_title="그라펜 쇼핑검색광고 통합 관리", layout="wide")
+st.title("그라펜 쇼핑검색광고 통합 관리")
 
 st.warning("API Key/Secret Key는 화면 입력값으로만 사용하는 것을 권장합니다.")
 
