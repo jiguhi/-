@@ -1,19 +1,21 @@
 """
 그라펜 - 네이버 쇼핑검색광고 통합 관리 (Streamlit)
 
-다섯 개 기능을 하나의 UI(탭)로 통합:
+여섯 개 기능을 하나의 UI(탭)로 통합:
   1) 카테고리별 광고그룹 생성 & 상품 등록 - CSV 업로드 -> 카테고리별 광고그룹 생성 -> SHOPPING_PRODUCT_AD 소재 일괄 등록
   2) 홍보문구 등록 (그룹 단위) - PROMOTION 확장소재
   3) 부가정보 확장소재 등록 (소재 단위) - SHOPPING_EXTRA 확장소재
   4) 광고그룹 복사 - 그룹 설정 + 타겟팅 + 쇼핑상품 소재 + 홍보문구 + 제외키워드를 새 그룹으로 복사
   5) 노출매체 설정 - 광고그룹 노출 매체 유형(검색/콘텐츠, 네이버/파트너) + 노출제한매체 일괄 변경
+  6) 파워링크 확장소재 - 추가제목(노출위치)/추가설명/홍보문구/서브링크/가격링크/이미지/비즈채널형 등
+     직접 입력 또는 기준 광고그룹의 확장소재(모든 종류)를 복사해서 광고그룹 단위로 일괄 등록
 
 실행:
     pip install -r requirements_streamlit.txt
     streamlit run 그라펜_확장소재_streamlit.py
 
 1번 탭의 "실행" 버튼은 실제로 광고그룹을 생성하고 소재를 등록합니다(라이브 API 호출).
-2/3/4/5번 탭은 "미리보기"(읽기 전용)를 먼저 돌려보고, 확인 체크박스를 켠 뒤 "실행" 버튼을 눌러야
+2/3/4/5/6번 탭은 "미리보기"(읽기 전용)를 먼저 돌려보고, 확인 체크박스를 켠 뒤 "실행" 버튼을 눌러야
 실제로 네이버에 반영됩니다.
 """
 
@@ -1597,6 +1599,276 @@ def run_media_target(
     return pd.DataFrame(rows)
 
 
+# =========================
+# 파워링크 확장소재 (그룹 단위) - 6번 탭용
+# =========================
+# 직접 입력 폼을 제공하는 타입. verified=True 는 실제 계정 응답으로 adExtension 구조를 확인한 타입.
+# 그 외 타입(가격링크, 이미지형 서브링크, 계산 등)은 '기타 (JSON 직접 입력)' 또는 '기준 그룹에서 복사'로 등록.
+PL_EXT_TYPES = {
+    "HEADLINE": {"label": "추가제목", "verified": True},
+    "DESCRIPTION_EXTRA": {"label": "추가설명", "verified": True},
+    "PROMOTION": {"label": "홍보문구", "verified": True},
+    "SUB_LINKS": {"label": "서브링크", "verified": True},
+    "POWER_LINK_IMAGE": {"label": "파워링크 이미지", "verified": True},
+    "PRICE_LINKS": {"label": "가격링크", "verified": False},
+    "PHONE": {"label": "전화번호 (비즈채널)", "verified": False, "channel": True},
+    "LOCATION": {"label": "위치정보 (비즈채널)", "verified": False, "channel": True},
+    "NAVER_TALK": {"label": "네이버 톡톡 (비즈채널)", "verified": False, "channel": True},
+    "BOOKING": {"label": "네이버 예약 (비즈채널)", "verified": False, "channel": True},
+}
+PL_EXT_RESTORE_FIELDS = [
+    "ownerId", "type", "adExtension", "pcChannelId", "mobileChannelId",
+    "usePeriod", "periodStartDt", "periodEndDt", "schedule", "userLock",
+]
+
+
+def pl_ext_label(ext_type):
+    return PL_EXT_TYPES.get(ext_type, {}).get("label", ext_type)
+
+
+def kst_date_to_utc(d):
+    """KST 날짜 자정 -> API 시각 문자열 (예: KST 2026-11-23 -> '2026-11-22T15:00:00.000Z')."""
+    dt = datetime(d.year, d.month, d.day) - pd.Timedelta(hours=9)
+    return dt.strftime("%Y-%m-%dT%H:%M:%S.000Z")
+
+
+def get_business_channels(api_key, secret_key, customer_id):
+    res = api_request(api_key, secret_key, customer_id, "GET", "/ncc/channels")
+    if not res.ok:
+        raise Exception(f"비즈채널 조회 실패: {res.status_code} / {res.text}")
+    return res.json()
+
+
+def pl_ext_content_key(ext_type, content, pc_channel=None, mobile_channel=None):
+    """
+    '같은 내용' 판정 키. 네이버는 같은 내용의 확장소재 중복 등록을 400(code 2023)으로 막고,
+    추가제목은 pin(노출 위치)만 달라도 같은 내용으로 본다 -> pin 은 키에서 뺀다.
+    adExtension 이 없는 비즈채널형(전화번호 등)은 채널 ID로 비교.
+    """
+    if content is None:
+        return ext_type, pc_channel, mobile_channel
+    if isinstance(content, dict):
+        content = {k: v for k, v in content.items() if k != "pin"}
+    return ext_type, json.dumps(content, sort_keys=True, ensure_ascii=False)
+
+
+def pl_ext_settings(content, use_period, start, end):
+    pin = content.get("pin") if isinstance(content, dict) else None
+    return pin, bool(use_period), (start if use_period else None), (end if use_period else None)
+
+
+def pl_existing_key(ext):
+    return pl_ext_content_key(ext.get("type"), ext.get("adExtension"), ext.get("pcChannelId"), ext.get("mobileChannelId"))
+
+
+def pl_existing_settings(ext):
+    return pl_ext_settings(ext.get("adExtension"), ext.get("usePeriod"), ext.get("periodStartDt"), ext.get("periodEndDt"))
+
+
+def pl_item_settings(item):
+    period = item.get("period")
+    return pl_ext_settings(item.get("content"), bool(period), *(period or (None, None)))
+
+
+def describe_pl_ext(ext_type, content, pc_channel=None):
+    if content is None:
+        return f"채널 {pc_channel}"
+    if ext_type == "HEADLINE":
+        pin = content.get("pin")
+        return content.get("headline", "") + (f" [위치{pin}]" if pin else "")
+    if ext_type == "DESCRIPTION_EXTRA":
+        return content.get("description", "")
+    if ext_type == "PROMOTION":
+        return f"{content.get('basicText', '')} / {content.get('additionalText', '')}"
+    if ext_type == "SUB_LINKS" and isinstance(content, list):
+        return ", ".join(str(x.get("name", "")) for x in content)
+    if ext_type == "POWER_LINK_IMAGE":
+        return str(content.get("imagePath", ""))[-40:]
+    return json.dumps(content, ensure_ascii=False)[:80]
+
+
+def build_pl_ext_payload(owner_id, item, ag):
+    """item: {"type", "content"(adExtension 또는 None), "channel"(pc, mobile) 또는 None, "period"(start, end) 또는 None, "schedule"}"""
+    payload = {"ownerId": owner_id, "type": item["type"], "userLock": False}
+    if item.get("content") is not None:
+        payload["adExtension"] = item["content"]
+    # 비즈채널형은 선택한 채널, 내용형은 광고그룹의 비즈채널(사이트)을 사용
+    pc_channel, mobile_channel = item.get("channel") or (ag.get("pcChannelId"), ag.get("mobileChannelId"))
+    if pc_channel:
+        payload["pcChannelId"] = pc_channel
+    if mobile_channel:
+        payload["mobileChannelId"] = mobile_channel
+    if item.get("period"):
+        payload["usePeriod"] = True
+        payload["periodStartDt"], payload["periodEndDt"] = item["period"]
+    if item.get("schedule"):
+        payload["schedule"] = item["schedule"]
+    return payload
+
+
+def restore_payload(ext):
+    payload = {k: ext[k] for k in PL_EXT_RESTORE_FIELDS if ext.get(k) is not None}
+    if not payload.get("usePeriod"):
+        payload.pop("periodStartDt", None)
+        payload.pop("periodEndDt", None)
+    return payload
+
+
+def plan_pl_ext_for_type(existing_same_type, items, mode, reregister):
+    """
+    한 광고그룹 / 한 확장소재 타입에 대해 무엇을 삭제하고 무엇을 만들지 결정.
+    반환: (to_delete, [(item, 동작, 메시지)])
+    mode: "추가" | "교체"
+    """
+    to_delete, plans = [], []
+    matched_ids = set()
+
+    for item in items:
+        key = pl_ext_content_key(item["type"], item.get("content"), *(item.get("channel") or (None, None)))
+        same = [e for e in existing_same_type if pl_existing_key(e) == key]
+        exact = [e for e in same if pl_existing_settings(e) == pl_item_settings(item)]
+        if exact:
+            matched_ids.add(exact[0]["nccAdExtensionId"])
+            plans.append((item, "변경없음", "같은 내용/설정 이미 있음"))
+        elif same and mode == "추가" and not reregister:
+            plans.append((item, "건너뜀", "같은 내용이 다른 위치/기간으로 있음"))
+        elif same:
+            to_delete.extend(same)
+            plans.append((item, "재등록", f"같은 내용 기존 {len(same)}개 삭제 후 등록"))
+        else:
+            plans.append((item, "생성", ""))
+
+    if mode == "교체":
+        for e in existing_same_type:
+            if e["nccAdExtensionId"] not in matched_ids and e not in to_delete:
+                to_delete.append(e)
+
+    return to_delete, plans
+
+
+def run_powerlink_extension(
+    api_key, secret_key, customer_id, groups, items, mode, reregister, dry_run, progress_cb=None,
+):
+    """
+    groups: [(캠페인명, adgroup dict)], items: 등록할 확장소재 목록 (build_pl_ext_payload 참고)
+    같은 내용 중복 등록이 막혀 있어서, 삭제가 필요한 경우 '삭제 -> 생성' 순서로 처리하고
+    생성이 하나라도 실패하면 삭제한 기존 확장소재를 원래 설정으로 다시 등록해 복구한다.
+    다른 타입의 확장소재는 건드리지 않는다.
+    """
+    items_by_type = defaultdict(list)
+    for item in items:
+        items_by_type[item["type"]].append(item)
+
+    total = len(groups)
+    rows = []
+
+    for i, (campaign_name, ag) in enumerate(groups, 1):
+        adgroup_id = ag["nccAdgroupId"]
+        existing = [
+            e for e in get_ad_extensions_by_owner(api_key, secret_key, customer_id, adgroup_id)
+            if not e.get("delFlag")
+        ]
+
+        for ext_type, type_items in items_by_type.items():
+            same_type = [e for e in existing if e.get("type") == ext_type]
+            to_delete, plans = plan_pl_ext_for_type(same_type, type_items, mode, reregister)
+
+            delete_note = ""
+            if to_delete:
+                delete_note = "삭제 대상: " + ", ".join(
+                    describe_pl_ext(ext_type, e.get("adExtension"), e.get("pcChannelId")) for e in to_delete
+                )
+
+            results = {}
+            if not dry_run and (to_delete or any(p[1] in ("생성", "재등록") for p in plans)):
+                deleted, errors = [], []
+                for e in to_delete:
+                    res = delete_ad_extension(api_key, secret_key, customer_id, e["nccAdExtensionId"])
+                    if res is not None and res.ok:
+                        deleted.append(e)
+                    else:
+                        errors.append(f"삭제 실패 {e['nccAdExtensionId']}: {res.status_code if res is not None else ''}")
+                    time.sleep(REQUEST_DELAY)
+
+                any_create_failed = False
+                for idx, (item, action, _) in enumerate(plans):
+                    if action not in ("생성", "재등록"):
+                        continue
+                    payload = build_pl_ext_payload(adgroup_id, item, ag)
+                    res = api_request(api_key, secret_key, customer_id, "POST", "/ncc/ad-extensions", json_data=payload)
+                    if res is not None and res.ok:
+                        body = res.json()
+                        results[idx] = ("성공", f"ID {body.get('nccAdExtensionId')} / 검수 {body.get('inspectStatus')}")
+                    else:
+                        any_create_failed = True
+                        results[idx] = ("실패", f"{res.status_code} / {res.text}" if res is not None else "응답 없음")
+                    time.sleep(REQUEST_DELAY)
+
+                if any_create_failed and deleted:
+                    for e in deleted:
+                        rr = api_request(
+                            api_key, secret_key, customer_id, "POST", "/ncc/ad-extensions", json_data=restore_payload(e),
+                        )
+                        errors.append(
+                            f"복구 {'성공' if rr is not None and rr.ok else '실패!! 수동 확인 필요'}: "
+                            + describe_pl_ext(ext_type, e.get("adExtension"), e.get("pcChannelId"))
+                        )
+                        time.sleep(REQUEST_DELAY)
+                elif deleted:
+                    delete_note = "삭제 완료: " + delete_note.removeprefix("삭제 대상: ")
+                if errors:
+                    delete_note = " | ".join(filter(None, [delete_note] + errors))
+
+            for idx, (item, action, msg) in enumerate(plans):
+                if dry_run:
+                    status = "미리보기" if action in ("생성", "재등록") else action
+                elif idx in results:
+                    status, msg = results[idx][0], " | ".join(filter(None, [msg, results[idx][1]]))
+                else:
+                    status = action
+                rows.append({
+                    "캠페인": campaign_name,
+                    "광고그룹": ag.get("name"),
+                    "광고그룹ID": adgroup_id,
+                    "확장소재": pl_ext_label(ext_type),
+                    "내용": describe_pl_ext(ext_type, item.get("content"), (item.get("channel") or (None,))[0]),
+                    "기간": "~".join(item["period"]) if item.get("period") else "",
+                    "동작": action,
+                    "상태": status,
+                    "메시지": msg,
+                    "기존 확장소재 처리": delete_note,
+                })
+
+            if mode == "교체" and to_delete and not plans:
+                rows.append({
+                    "캠페인": campaign_name, "광고그룹": ag.get("name"), "광고그룹ID": adgroup_id,
+                    "확장소재": pl_ext_label(ext_type), "내용": "", "기간": "", "동작": "삭제",
+                    "상태": "미리보기" if dry_run else "완료", "메시지": "", "기존 확장소재 처리": delete_note,
+                })
+
+        if progress_cb:
+            progress_cb(i, total, f"{campaign_name} / {ag.get('name')}")
+
+    return pd.DataFrame(rows)
+
+
+def items_from_source_extensions(source_exts):
+    """기준 그룹의 확장소재를 그대로(내용/기간/요일시간/비즈채널형 채널) 복사할 item 으로 변환."""
+    items = []
+    for e in source_exts:
+        content = e.get("adExtension")
+        item = {
+            "type": e.get("type"),
+            "content": content,
+            # 비즈채널형(내용 없음)만 원본 채널 유지, 내용형은 대상 그룹의 사이트 채널 사용
+            "channel": (e.get("pcChannelId"), e.get("mobileChannelId")) if content is None else None,
+            "period": (e.get("periodStartDt"), e.get("periodEndDt")) if e.get("usePeriod") else None,
+            "schedule": e.get("schedule"),
+        }
+        items.append(item)
+    return items
+
+
 def make_progress(progress_bar, log_box):
     log_lines = []
 
@@ -1624,12 +1896,13 @@ with st.sidebar:
     customer_id = st.text_input("Customer ID", value=settings.get("customer_id", "")).strip()
     st.caption("대행사 키라 Customer ID만 바꾸면 다른 광고주 계정에도 그대로 쓸 수 있습니다.")
 
-tab_group, tab_promo, tab_extra, tab_copy, tab_media = st.tabs([
+tab_group, tab_promo, tab_extra, tab_copy, tab_media, tab_plext = st.tabs([
     "카테고리별 광고그룹 생성 & 상품 등록",
     "홍보문구 등록 (광고그룹 단위)",
     "부가정보 확장소재 등록 (소재 단위)",
     "광고그룹 복사",
     "노출매체 설정",
+    "파워링크 확장소재",
 ])
 
 # ---------- Tab 1: 카테고리별 광고그룹 생성 & 상품 등록 ----------
@@ -2252,4 +2525,289 @@ with tab_media:
             df_media.to_csv(index=False).encode("utf-8-sig"),
             file_name=f"노출매체_변경결과_{datetime.now():%Y%m%d_%H%M%S}.csv",
             key="download_5",
+        )
+
+# ---------- Tab 6: 파워링크 확장소재 ----------
+with tab_plext:
+    st.subheader("파워링크 확장소재 등록 (광고그룹 단위)")
+    st.caption(
+        "파워링크(WEB_SITE) 캠페인의 광고그룹에 확장소재를 일괄 등록합니다. "
+        "확장소재 수정(PUT)은 200 응답이 와도 내용이 바뀌지 않고, 같은 내용은 중복 등록이 막혀 있어서 "
+        "기존 확장소재를 바꿔야 할 때는 '기존 삭제 -> 새로 등록' 순서로 처리하며, 등록 실패 시 삭제한 것을 원래대로 복구합니다. "
+        "선택하지 않은 종류의 확장소재는 건드리지 않습니다."
+    )
+
+    if st.button("캠페인 목록 불러오기", key="load_campaigns_6"):
+        with st.spinner("캠페인 조회 중..."):
+            try:
+                st.session_state["campaigns_6"] = [
+                    c for c in get_campaigns(api_key, secret_key, customer_id) if c.get("campaignTp") == "WEB_SITE"
+                ]
+                st.session_state["channels_6"] = get_business_channels(api_key, secret_key, customer_id)
+            except Exception as e:
+                st.error(f"조회 실패: {e}")
+
+    campaigns_6 = st.session_state.get("campaigns_6", [])
+    campaign_by_id_6 = {c["nccCampaignId"]: c for c in campaigns_6}
+    selected_campaign_ids_6 = st.multiselect(
+        "대상 파워링크 캠페인 선택", list(campaign_by_id_6),
+        format_func=lambda cid: f"{campaign_by_id_6[cid]['name']} ({campaign_by_id_6[cid].get('status', '')})",
+        key="selected_campaigns_6",
+    )
+
+    group_options_6 = {}
+    cache_6 = st.session_state.setdefault("adgroups_6", {})
+    for cid in selected_campaign_ids_6:
+        if cid not in cache_6:
+            try:
+                cache_6[cid] = get_adgroups_by_campaign(api_key, secret_key, customer_id, cid)
+            except Exception as e:
+                st.error(f"광고그룹 조회 실패: {e}")
+        for ag in cache_6.get(cid, []):
+            group_options_6[ag["nccAdgroupId"]] = (campaign_by_id_6[cid]["name"], ag)
+
+    selected_group_ids_6 = st.multiselect(
+        "광고그룹 선택 (비워두면 선택한 캠페인의 모든 광고그룹)", list(group_options_6),
+        format_func=lambda gid: f"{group_options_6[gid][0]} / {group_options_6[gid][1].get('name')}",
+        key="selected_groups_6",
+    )
+    target_groups_6 = [group_options_6[gid] for gid in (selected_group_ids_6 or list(group_options_6))]
+    if group_options_6:
+        st.caption(f"대상 광고그룹 {len(target_groups_6)}개")
+
+    source_mode_6 = st.radio(
+        "등록 방식", ["직접 입력", "기준 광고그룹에서 복사"], horizontal=True, key="source_mode_6",
+        help="기준 광고그룹에서 복사: 광고센터에서 한 그룹에 만들어 둔 확장소재(이미지·가격링크 등 모든 종류)를 그대로 다른 그룹에 복사",
+    )
+
+    items_6 = []
+    input_errors_6 = []
+    channels_6 = st.session_state.get("channels_6", [])
+    channel_by_id_6 = {ch["nccBusinessChannelId"]: ch for ch in channels_6}
+
+    def channel_label_6(cid):
+        ch = channel_by_id_6[cid]
+        return f"{ch.get('name')} [{ch.get('channelTp')}] ({cid})"
+
+    if source_mode_6 == "직접 입력":
+        type_options_6 = list(PL_EXT_TYPES) + ["OTHER"]
+        selected_types_6 = st.multiselect(
+            "등록할 확장소재 종류", type_options_6,
+            format_func=lambda t: "기타 (JSON 직접 입력)" if t == "OTHER" else (
+                PL_EXT_TYPES[t]["label"] + ("" if PL_EXT_TYPES[t]["verified"] else " - 구조 미검증")
+            ),
+            key="selected_types_6",
+        )
+
+        use_period_6 = st.checkbox("노출 기간 설정", value=False, key="use_period_6")
+        period_6 = None
+        if use_period_6:
+            col_p1, col_p2 = st.columns(2)
+            with col_p1:
+                start_6 = st.date_input("시작일", key="start_6")
+            with col_p2:
+                end_6 = st.date_input("종료일", key="end_6")
+            if end_6 < start_6:
+                input_errors_6.append("종료일이 시작일보다 빠릅니다.")
+            period_6 = (kst_date_to_utc(start_6), kst_date_to_utc(end_6))
+            st.caption(f"API 저장값(KST 자정 기준): {period_6[0]} ~ {period_6[1]}")
+
+        for t in selected_types_6:
+            st.markdown(f"**{'기타 (JSON 직접 입력)' if t == 'OTHER' else PL_EXT_TYPES[t]['label']}**")
+
+            if t == "HEADLINE":
+                lines = [x.strip() for x in st.text_area("추가제목 (한 줄에 하나씩)", key="headline_6").splitlines() if x.strip()]
+                pin = st.selectbox(
+                    "노출 위치", [None, 1, 2], format_func=lambda p: "미고정" if p is None else f"위치{p}",
+                    key="headline_pin_6",
+                )
+                for line in lines:
+                    content = {"headline": line}
+                    if pin:
+                        content["pin"] = pin
+                    items_6.append({"type": t, "content": content, "period": period_6})
+
+            elif t == "DESCRIPTION_EXTRA":
+                lines = [x.strip() for x in st.text_area("추가설명 (한 줄에 하나씩)", key="desc_extra_6").splitlines() if x.strip()]
+                items_6 += [{"type": t, "content": {"description": line}, "period": period_6} for line in lines]
+
+            elif t == "PROMOTION":
+                col_a, col_b = st.columns(2)
+                with col_a:
+                    basic = st.text_input("문구1", key="promo_basic_6")
+                with col_b:
+                    additional = st.text_input("문구2", key="promo_additional_6")
+                if basic:
+                    items_6.append({
+                        "type": t, "content": {"basicText": basic, "additionalText": additional}, "period": period_6,
+                    })
+
+            elif t == "SUB_LINKS":
+                st.caption("링크 이름과 연결 URL. URL에 {keyword_id} 같은 치환 파라미터도 그대로 쓸 수 있습니다.")
+                sub_df = st.data_editor(
+                    pd.DataFrame([{"name": "", "final": ""}] * 3), num_rows="dynamic", key="sublinks_6",
+                    use_container_width=True,
+                )
+                links = [
+                    {"name": str(r["name"]).strip(), "final": str(r["final"]).strip()}
+                    for _, r in sub_df.iterrows()
+                    if str(r["name"] or "").strip() and str(r["final"] or "").strip()
+                ]
+                if links:
+                    items_6.append({"type": t, "content": links, "period": period_6})
+
+            elif t == "PRICE_LINKS":
+                st.caption("구조 미검증: 미리보기 후 '1개 그룹에만 먼저 실행'으로 광고센터에서 확인하세요.")
+                price_df = st.data_editor(
+                    pd.DataFrame([{"name": "", "price": 0, "modifier": "", "final": ""}] * 3),
+                    num_rows="dynamic", key="pricelinks_6", use_container_width=True,
+                )
+                links = [
+                    {
+                        "name": str(r["name"]).strip(), "price": int(r["price"] or 0),
+                        "modifier": str(r["modifier"] or "").strip(), "final": str(r["final"]).strip(),
+                    }
+                    for _, r in price_df.iterrows()
+                    if str(r["name"] or "").strip() and str(r["final"] or "").strip()
+                ]
+                if links:
+                    items_6.append({"type": t, "content": links, "period": period_6})
+
+            elif t == "POWER_LINK_IMAGE":
+                st.caption(
+                    "네이버 이미지 경로(imagePath)가 필요합니다. "
+                    "광고센터에 올린 이미지는 '기준 광고그룹에서 복사'를 쓰는 게 편합니다."
+                )
+                col_i1, col_i2, col_i3 = st.columns([3, 1, 1])
+                with col_i1:
+                    image_path = st.text_input("imagePath", key="image_path_6")
+                with col_i2:
+                    image_w = st.number_input("가로(px)", min_value=1, value=640, key="image_w_6")
+                with col_i3:
+                    image_h = st.number_input("세로(px)", min_value=1, value=640, key="image_h_6")
+                if image_path:
+                    items_6.append({
+                        "type": t, "period": period_6,
+                        "content": {"imagePath": image_path, "imageWidth": int(image_w), "imageHeight": int(image_h)},
+                    })
+
+            elif t != "OTHER" and PL_EXT_TYPES[t].get("channel"):
+                if not channels_6:
+                    st.info("'캠페인 목록 불러오기'를 누르면 비즈채널 목록도 함께 불러옵니다.")
+                channel_id = st.selectbox(
+                    "비즈채널", [None] + list(channel_by_id_6),
+                    format_func=lambda cid: "선택" if cid is None else channel_label_6(cid),
+                    key=f"channel_{t}_6",
+                )
+                st.caption("구조 미검증: 미리보기 후 '1개 그룹에만 먼저 실행'으로 광고센터에서 확인하세요.")
+                if channel_id:
+                    items_6.append({"type": t, "content": None, "channel": (channel_id, channel_id), "period": period_6})
+
+            elif t == "OTHER":
+                other_type = st.text_input("확장소재 type (예: IMAGE_SUB_LINKS)", key="other_type_6").strip().upper()
+                other_json = st.text_area("adExtension JSON (내용이 없는 타입이면 비워두기)", key="other_json_6")
+                other_channel = st.selectbox(
+                    "비즈채널 (선택 안 하면 광고그룹의 사이트 채널)", [None] + list(channel_by_id_6),
+                    format_func=lambda cid: "광고그룹 채널 사용" if cid is None else channel_label_6(cid),
+                    key="other_channel_6",
+                )
+                if other_type:
+                    try:
+                        content = json.loads(other_json) if other_json.strip() else None
+                        items_6.append({
+                            "type": other_type, "content": content, "period": period_6,
+                            "channel": (other_channel, other_channel) if other_channel else None,
+                        })
+                    except json.JSONDecodeError as e:
+                        input_errors_6.append(f"adExtension JSON 형식 오류: {e}")
+
+    else:
+        source_group_id_6 = st.selectbox(
+            "기준 광고그룹 (위에서 선택한 캠페인의 그룹 중에서 선택)", [None] + list(group_options_6),
+            format_func=lambda gid: "선택" if gid is None else f"{group_options_6[gid][0]} / {group_options_6[gid][1].get('name')}",
+            key="source_group_6",
+            help="기준 그룹 자신은 대상에서 빠집니다. 기간·요일/시간 설정도 원본 그대로 복사됩니다.",
+        )
+        if source_group_id_6:
+            src_cache_6 = st.session_state.setdefault("source_exts_6", {})
+            if source_group_id_6 not in src_cache_6:
+                src_cache_6[source_group_id_6] = [
+                    e for e in get_ad_extensions_by_owner(api_key, secret_key, customer_id, source_group_id_6)
+                    if not e.get("delFlag")
+                ]
+            source_exts_6 = src_cache_6[source_group_id_6]
+            ext_by_id_6 = {e["nccAdExtensionId"]: e for e in source_exts_6}
+            selected_ext_ids_6 = st.multiselect(
+                f"복사할 확장소재 (기준 그룹에 {len(source_exts_6)}개)", list(ext_by_id_6),
+                format_func=lambda eid: (
+                    f"[{pl_ext_label(ext_by_id_6[eid]['type'])}] "
+                    + describe_pl_ext(
+                        ext_by_id_6[eid]["type"], ext_by_id_6[eid].get("adExtension"), ext_by_id_6[eid].get("pcChannelId"),
+                    )
+                    + f" ({ext_by_id_6[eid].get('inspectStatus')})"
+                ),
+                key="selected_exts_6",
+            )
+            items_6 = items_from_source_extensions([ext_by_id_6[eid] for eid in selected_ext_ids_6])
+            target_groups_6 = [g for g in target_groups_6 if g[1]["nccAdgroupId"] != source_group_id_6]
+
+    st.markdown("**같은 종류의 기존 확장소재 처리**")
+    mode_6 = st.radio(
+        "처리 방식", ["추가", "교체"], horizontal=True, key="mode_6",
+        help="추가: 기존 확장소재는 그대로 두고 새로 등록 / 교체: 선택한 종류의 기존 확장소재를 모두 지우고 새로 등록",
+    )
+    reregister_6 = True
+    if mode_6 == "추가":
+        reregister_6 = st.checkbox(
+            "같은 내용이 위치/기간만 다르게 이미 있으면 지우고 다시 등록", value=True, key="reregister_6",
+            help="예: 같은 추가제목이 '미고정'으로 있는데 '위치2'로 등록하려는 경우. 끄면 건너뜁니다.",
+        )
+    else:
+        st.warning("교체: 대상 그룹에서 선택한 종류의 기존 확장소재가 모두 삭제됩니다. 미리보기의 '기존 확장소재 처리' 열을 꼭 확인하세요.")
+
+    for err in input_errors_6:
+        st.error(err)
+
+    ready_6 = bool(target_groups_6 and items_6 and not input_errors_6)
+    if items_6:
+        st.caption(f"등록할 확장소재 {len(items_6)}개 x 대상 광고그룹 {len(target_groups_6)}개")
+    plext_args_6 = dict(groups=target_groups_6, items=items_6, mode=mode_6, reregister=reregister_6)
+
+    if st.button("🔍 미리보기 (실제 등록 안 함)", key="preview_6", disabled=not ready_6):
+        progress_bar = st.progress(0)
+        log_box = st.empty()
+        with st.spinner("조회 중..."):
+            df_plext = run_powerlink_extension(
+                api_key, secret_key, customer_id, **plext_args_6,
+                dry_run=True, progress_cb=make_progress(progress_bar, log_box),
+            )
+        st.session_state["preview_df_6"] = df_plext
+
+    if "preview_df_6" in st.session_state:
+        st.dataframe(st.session_state["preview_df_6"], use_container_width=True)
+
+    limit_one_6 = st.checkbox("첫 번째 광고그룹 1개에만 먼저 실행 (테스트용)", value=False, key="limit_one_6")
+    confirm_6 = st.checkbox("실제로 네이버 광고그룹에 확장소재를 등록/삭제합니다 (라이브 API 호출)", key="confirm_6")
+    if st.button("🚀 실행 (실제 등록)", key="run_6", disabled=not (ready_6 and confirm_6)):
+        progress_bar = st.progress(0)
+        log_box = st.empty()
+        run_args_6 = dict(plext_args_6)
+        if limit_one_6:
+            run_args_6["groups"] = target_groups_6[:1]
+        with st.spinner("등록 중..."):
+            df_plext = run_powerlink_extension(
+                api_key, secret_key, customer_id, **run_args_6,
+                dry_run=False, progress_cb=make_progress(progress_bar, log_box),
+            )
+        st.session_state["result_df_6"] = df_plext
+        st.success("완료! 새로 등록한 확장소재는 네이버 검수 후 노출됩니다.")
+
+    if "result_df_6" in st.session_state:
+        df_plext = st.session_state["result_df_6"]
+        st.dataframe(df_plext, use_container_width=True)
+        st.download_button(
+            "결과 CSV 다운로드",
+            df_plext.to_csv(index=False).encode("utf-8-sig"),
+            file_name=f"파워링크_확장소재_결과_{datetime.now():%Y%m%d_%H%M%S}.csv",
+            key="download_6",
         )
